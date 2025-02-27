@@ -2,6 +2,7 @@ import gzip
 import io
 import json
 import uuid
+from typing import Literal
 
 import aiohttp
 from urllib.parse import quote
@@ -39,8 +40,11 @@ class ServiceTitanIntegration(Integration):
     ):
         if response.status == 200:
             try:
+                # print(await response.read())
+                t = await response.text()
                 data = await response.json()
             except (json.decoder.JSONDecodeError, aiohttp.ContentTypeError):
+                x = await response.read()
                 data = await response.read()
 
             return data
@@ -60,9 +64,12 @@ class ServiceTitanIntegration(Integration):
                 response.reason,
             )
         else:
+            r_headers = response.headers
+            print(r_headers)
+            msg = r_headers.get("x-message")
             raise IntegrationAPIError(
                 self.integration_name,
-                f"{response_json}",
+                f"{msg}",
                 response.status,
                 response.reason,
             )
@@ -72,6 +79,7 @@ class ServiceTitanIntegration(Integration):
             "Host": f"{self.domain}",
             "User-Agent": self.user_agent,
             "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
         }
         if isinstance(token, dict):
             token = cookie_dict_to_string(token)
@@ -79,8 +87,8 @@ class ServiceTitanIntegration(Integration):
         self.headers["Cookie"] = token
         self.network_requester = network_requester
 
-    async def fetch_job_media(self, job_id: str):
-        url = f"{self.api_url}/fam/attachments/1/{job_id}"
+    async def fetch_context_media(self, context_id: int, context_type: int = Literal[1, 2, 3]):
+        url = f"{self.api_url}/fam/attachments/{context_type}/{context_id}"
         params = {
             'limit': '1000',
             'photosVideosOnly': 'true',
@@ -125,15 +133,60 @@ class ServiceTitanIntegration(Integration):
                         response.reason
                     )
 
-    async def upload_job_media(self, job_id: str, file_name: str, file_content: bytes, content_type: str):
+    async def add_attachment(self,  context_id: int, file_name: str, file_content: bytes, content_type: str,
+                             context: str = Literal["Customer", "Location", "Job"]):
+        try:
+            uploaded_name = await self._upload_media(
+                content_type=content_type, file_content=file_content, file_name=file_name
+            )
+            link = f"{self.url}/Attach/Customer?name={uploaded_name}"
+
+            attach_data = {
+                'id': context_id,
+                'filename': uploaded_name,
+                'originalFilename': file_name,
+            }
+            headers = self.headers.copy()
+            headers["Content-Type"] = "application/json"
+            headers["Accept"] = "application/json"
+
+            url_attach = f"{self.url}/{context}/AddAttachment"
+            attach_response = await self._make_request(
+                method="POST",
+                url=url_attach,
+                json=attach_data,
+                headers=headers
+            )
+            if attach_response.get("Error"):
+                message = attach_response.get("Error").get("Message")
+                raise IntegrationAPIError(
+                    status_code=404,
+                    message=message,
+                    integration_name="service_titan"
+                )
+
+            return {
+                "success": True,
+                "url": link
+            }
+
+        except Exception as e:
+            if isinstance(e, IntegrationAPIError):
+                raise e
+
+            raise IntegrationAPIError(
+                status_code=500,
+                message=f"Error attaching media: {str(e)}",
+                integration_name="service_titan"
+            )
+
+    async def _upload_media(self, content_type: str, file_content: bytes, file_name: str):
         try:
             unique_id = str(uuid.uuid4())
             file_size = len(file_content)
             boundary = "----WebKitFormBoundaryCUVolhkgYrclodXz"
-
             # Manually construct multipart form-data
             form_data = []
-
             # Add all form fields
             fields = {
                 'resumableChunkNumber': '1',
@@ -146,28 +199,23 @@ class ServiceTitanIntegration(Integration):
                 'resumableRelativePath': file_name,
                 'resumableTotalChunks': '1'
             }
-
             # Add regular fields
             for key, value in fields.items():
                 form_data.append(f'--{boundary}\r\n')
                 form_data.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n')
                 form_data.append(f'{value}\r\n')
-
             # Add file
             form_data.append(f'--{boundary}\r\n')
             form_data.append(f'Content-Disposition: form-data; name="file"; filename="blob"\r\n')
             form_data.append('Content-Type: application/octet-stream\r\n\r\n')
-
             # Convert form_data to bytes and combine with file content
             form_bytes = ''.join(form_data).encode('utf-8')
             final_boundary = f'\r\n--{boundary}--\r\n'.encode('utf-8')
-
             body = b''.join([
                 form_bytes,
                 file_content,
                 final_boundary
             ])
-
             # First request - Upload the file
             headers = self.headers.copy()
             headers.update({
@@ -175,7 +223,6 @@ class ServiceTitanIntegration(Integration):
                 'X-Requested-With': 'XMLHttpRequest',
                 'Content-Type': f'multipart/form-data; boundary={boundary}'
             })
-
             url_upload = f"{self.url}/upload/AttachmentChunkWithValidating"
             upload_response = await self._make_request(
                 method="POST",
@@ -183,46 +230,18 @@ class ServiceTitanIntegration(Integration):
                 headers=headers,
                 data=body
             )
-
             if not upload_response:
                 raise ValueError("Failed to get response from upload endpoint")
-
             # Decode bytes to string if necessary
             if isinstance(upload_response, bytes):
                 uploaded_name = upload_response.decode('utf-8').strip()
             else:
                 uploaded_name = str(upload_response).strip()
 
-            link = f"{self.url}/Attach/Customer?name={uploaded_name}"
-
-            # Second request - Attach to job
-            attach_data = {
-                'id': int(job_id),
-                'filename': uploaded_name,
-                'originalFilename': file_name,
-            }
-
-            headers["Content-Type"] = "application/json; charset=UTF-8"
-            url_attach = f"{self.url}/Job/AddAttachment"
-            attach_response = await self._make_request(
-                method="POST",
-                url=url_attach,
-                json=attach_data,
-                headers=headers
-            )
-
-            if not attach_response:
-                raise ValueError("Failed to attach file to job")
-
-            return {
-                "success": True,
-                "url": link
-            }
-
+            return uploaded_name
         except Exception as e:
-            # Log the error details here
             raise IntegrationAPIError(
                 status_code=500,
-                message=f"Error uploading media: {str(e)}",
+                message=f"Error uploading file: {str(e)}",
                 integration_name="service_titan"
             )

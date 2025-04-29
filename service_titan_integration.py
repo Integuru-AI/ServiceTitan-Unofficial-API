@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from aiohttp import FormData
 from fake_useragent import UserAgent
-from helpers.utils.tools import cookie_dict_to_string
+from helpers.tools import cookie_dict_to_string
 from submodule_integrations.models.integration import Integration
 from submodule_integrations.utils.errors import IntegrationAPIError, IntegrationAuthError
 
